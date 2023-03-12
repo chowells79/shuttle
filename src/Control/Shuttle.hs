@@ -69,7 +69,7 @@ import Control.Concurrent.STM
 -- to the foreground when complete.
 data Shuttle m = Shuttle (TVar (SF m)) (IO ())
 
--- non-impredicate wapper to for older GHC compatibility
+-- non-impredicate wapper for older GHC compatibility
 newtype SF m = SF { runSF :: forall a. m a -> IO a }
 
 -- Pack together an action and a TMVar that can hold the result of
