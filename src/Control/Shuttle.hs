@@ -9,8 +9,9 @@ module Control.Shuttle
   ) where
 
 -- base
-import Control.Concurrent (forkIO, mkWeakThreadId)
+import Control.Concurrent (forkIO, mkWeakThreadId, threadDelay)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import Data.Function (fix)
 import System.Mem.Weak (deRefWeak)
 
 import GHC.Conc(ThreadStatus(..), threadStatus)
@@ -26,7 +27,8 @@ import Control.Monad.Catch
 
 -- stm
 import Control.Concurrent.STM
-    ( atomically
+    ( STM
+    , atomically
     , TVar
     , newTVar
     , readTVar
@@ -69,7 +71,7 @@ import Control.Concurrent.STM
 -- to the foreground when complete.
 data Shuttle m = Shuttle (TVar (SF m)) (IO ())
 
--- non-impredicate wapper for older GHC compatibility
+-- non-impredicative wrapper for older GHC compatibility
 newtype SF m = SF { runSF :: forall a. m a -> IO a }
 
 -- Pack together an action and a TMVar that can hold the result of
@@ -88,13 +90,9 @@ instance Exception ShuttleStopped
 
 -- | Run an action in the background thread for this Shuttle. Any
 -- exceptions raised during the execution of the action are caught and
--- re-raised by this. Does best-effort detection of the background
--- thread having stopped, but there is a window where this can be left
--- hanging. Hitting that case should require an async exception being
--- thrown to the background thread, or the background thread being
--- started without a proper try-like action. There's nothing that can
--- be done to prevent those cases and this is mostly intended for
--- interactive use, so I'm not too worried about them.
+-- re-raised by this. If the background thread has been died, that
+-- will eventually be detected and reported with a 'ShuttleStopped'
+-- exception.
 shuttle :: Shuttle m -> m a -> IO a
 shuttle (Shuttle ref _) act = do
     sFunc <- atomically $ readTVar ref
@@ -144,29 +142,31 @@ startShuttle' tryLike runner = do
     -- it detect when the thread is deadlocked in an STM action.
     wtid <- mkWeakThreadId =<< forkIO (runner execLoop)
 
-    let remote act = do
-            -- best-effort detection of the background thread not running
-            mtid <- deRefWeak wtid
-            tid <- maybe (throwM ShuttleStopped) pure mtid
-            status <- threadStatus tid
-            case status of
-                ThreadFinished -> throwM ShuttleStopped
-                ThreadDied -> throwM ShuttleStopped
-                _ -> pure ()
+    let stop = atomically $ writeTVar shutdown True
 
+        remote act = do
             -- Check if the background thread is in the process of a
-            -- graceful sthutdown, and send it a request if not.
-            mbox <- atomically $ do
+            -- graceful shutdown, and send it a request if not.
+            mbox <- loop $ do
                 done <- readTVar shutdown
                 if done then throwM ShuttleStopped else pure ()
                 receiver <- newEmptyTMVar
                 putTMVar request $ Pack act receiver
                 pure receiver
 
-            response <- atomically $ takeTMVar mbox
+            -- grab the result
+            response <- loop $ takeTMVar mbox
             either throwM pure response
-
-        stop = atomically $ writeTVar shutdown True
+          where
+            loop stm = loopUntilJust (checkThread >> timeoutAtomically 100000 stm)
+            checkThread = do
+                maybetid <- deRefWeak wtid
+                tid <- maybe (throwM ShuttleStopped) pure maybetid
+                status <- threadStatus tid
+                case status of
+                    ThreadFinished -> throwM ShuttleStopped
+                    ThreadDied -> throwM ShuttleStopped
+                    _ -> pure ()
 
     -- Install the stop action as a finalizer on the TVar holding the
     -- remote call action.
@@ -174,6 +174,23 @@ startShuttle' tryLike runner = do
     _ <- mkWeakTVar ref stop
 
     return $ Shuttle ref stop
+
+
+timeoutAtomically :: Int -> STM a -> IO (Maybe a)
+timeoutAtomically delay act = do
+    expired <- atomically $ newTVar False
+    _ <- forkIO $ threadDelay delay >> atomically (writeTVar expired True)
+    atomically $ do
+        done <- readTVar expired
+        if done then pure Nothing else Just <$> act
+
+
+loopUntilJust :: IO (Maybe a) -> IO a
+loopUntilJust act = fix $ \loop -> do
+    result <- act
+    case result of
+        Nothing -> loop
+        Just x -> pure x
 
 
 -- | Signal to a Shuttle that it may be gracefully stopped. This stop
