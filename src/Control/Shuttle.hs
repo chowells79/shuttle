@@ -126,28 +126,27 @@ startShuttle'
 startShuttle' tryLike runner = do
     (shutdown, request) <- atomically $ (,) <$> newTVar False <*> newEmptyTMVar
 
-    let execLoop = do
-            next <- liftIO . atomically $ do
-                done <- readTVar shutdown
-                if done then pure Nothing else Just <$> takeTMVar request
-            case next of
-                Nothing -> pure () -- graceful shutdown
-                Just (Pack act send) -> do
-                    result <- tryLike act
-                    liftIO . atomically $ putTMVar send result
-                    execLoop
+    -- fork off the background loop
+    tid <- forkIO . runner . fix $ \loop -> do
+        next <- liftIO . atomically $ do
+            done <- readTVar shutdown
+            if done then pure Nothing else Just <$> takeTMVar request
+        case next of
+            Nothing -> pure () -- graceful shutdown
+            Just (Pack act send) -> do
+                result <- tryLike act
+                liftIO . atomically $ putTMVar send result
+                loop
 
-    -- Only store a weak reference to the ThreadId. This aids the
-    -- runtime in determining when it can collect the thread and helps
-    -- it detect when the thread is deadlocked in an STM action.
-    wtid <- mkWeakThreadId =<< forkIO (runner execLoop)
+    -- keep a weak reference to the ThreadId around to not cause GC issues
+    backgroundThread <- mkWeakThreadId tid
 
     let stop = atomically $ writeTVar shutdown True
 
         remote act = do
             -- Check if the background thread is in the process of a
             -- graceful shutdown, and send it a request if not.
-            mbox <- loop $ do
+            mbox <- periodicallyCheck $ do
                 done <- readTVar shutdown
                 if done then throwM ShuttleStopped else pure ()
                 receiver <- newEmptyTMVar
@@ -155,18 +154,21 @@ startShuttle' tryLike runner = do
                 pure receiver
 
             -- grab the result
-            response <- loop $ takeTMVar mbox
+            response <- periodicallyCheck $ takeTMVar mbox
             either throwM pure response
-          where
-            loop stm = loopUntilJust (checkThread >> timeoutAtomically 100000 stm)
-            checkThread = do
-                maybetid <- deRefWeak wtid
-                tid <- maybe (throwM ShuttleStopped) pure maybetid
-                status <- threadStatus tid
-                case status of
-                    ThreadFinished -> throwM ShuttleStopped
-                    ThreadDied -> throwM ShuttleStopped
-                    _ -> pure ()
+
+        periodicallyCheck stm = loopUntilJust $ do
+            checkThread
+            timeoutAtomically 100000 stm
+
+        checkThread = do
+            maybetid <- deRefWeak backgroundThread
+            btid <- maybe (throwM ShuttleStopped) pure maybetid
+            status <- threadStatus btid
+            case status of
+                ThreadFinished -> throwM ShuttleStopped
+                ThreadDied -> throwM ShuttleStopped
+                _ -> pure ()
 
     -- Install the stop action as a finalizer on the TVar holding the
     -- remote call action.
