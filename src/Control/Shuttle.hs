@@ -10,6 +10,7 @@ module Control.Shuttle
 
 -- base
 import Control.Concurrent (forkIO, mkWeakThreadId, threadDelay)
+import Control.Exception (ErrorCall(..))
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Function (fix)
 import System.Mem.Weak (deRefWeak)
@@ -22,6 +23,7 @@ import Control.Monad.Catch
     , Exception
     , throwM
     , MonadCatch
+    , catch
     , try
     )
 
@@ -32,6 +34,7 @@ import Control.Concurrent.STM
     , newTVar
     , readTVar
     , writeTVar
+    , registerDelay
     , mkWeakTVar
     , TMVar
     , newEmptyTMVar
@@ -145,7 +148,7 @@ startShuttle' tryLike runner = do
         remote act = do
             -- Check if the background thread is in the process of a
             -- graceful shutdown, and send it a request if not.
-            mbox <- periodicallyCheck $ do
+            mbox <- periodicallyCheckThread $ do
                 done <- readTVar shutdown
                 if done then throwM ShuttleStopped else pure ()
                 receiver <- newEmptyTMVar
@@ -153,20 +156,10 @@ startShuttle' tryLike runner = do
                 pure receiver
 
             -- grab the result
-            response <- periodicallyCheck $ takeTMVar mbox
+            response <- periodicallyCheckThread $ takeTMVar mbox
             either throwM pure response
 
-        periodicallyCheck stm = loopUntilJust $ do
-            checkThread
-            timeoutAtomically 100000 stm
-
-        loopUntilJust act = fix $ \loop -> do
-            result <- act
-            case result of
-                Nothing -> loop
-                Just x -> pure x
-
-        checkThread = do
+        periodicallyCheckThread stm = loopUntilJust $ do
             maybetid <- deRefWeak backgroundThread
             btid <- maybe (throwM ShuttleStopped) pure maybetid
             status <- threadStatus btid
@@ -174,12 +167,24 @@ startShuttle' tryLike runner = do
                 ThreadFinished -> throwM ShuttleStopped
                 ThreadDied -> throwM ShuttleStopped
                 _ -> pure ()
+            timeoutAtomically stm
 
-        timeoutAtomically delay act = do
-            expired <- atomically $ newTVar False
-            _ <- forkIO $ do
-                threadDelay delay
-                atomically $ writeTVar expired True
+        loopUntilJust act = fix $ \loop -> do
+            result <- act
+            case result of
+                Nothing -> loop
+                Just x -> pure x
+
+        timeoutAtomically act = do
+            let delay = 100000
+            -- work around that horrible issue where registerDelay is
+            -- unimplemented on the non-threaded runtime
+            expired <- registerDelay delay `catch` \(ErrorCall _) -> do
+                var <- atomically $ newTVar False
+                _ <- forkIO $ do
+                    threadDelay delay
+                    atomically $ writeTVar var True
+                pure var
             atomically $ do
                 done <- readTVar expired
                 if done then pure Nothing else Just <$> act

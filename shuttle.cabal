@@ -69,7 +69,7 @@ library
 
     -- Other library packages from which modules are imported.
     build-depends:    base >=4.9 && <5,
-                      exceptions >0.8 && < 1,
+                      exceptions >0.8 && <1,
                       stm >2 && <3
 
     -- Directories containing source files.
