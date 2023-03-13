@@ -27,8 +27,7 @@ import Control.Monad.Catch
 
 -- stm
 import Control.Concurrent.STM
-    ( STM
-    , atomically
+    ( atomically
     , TVar
     , newTVar
     , readTVar
@@ -161,6 +160,12 @@ startShuttle' tryLike runner = do
             checkThread
             timeoutAtomically 100000 stm
 
+        loopUntilJust act = fix $ \loop -> do
+            result <- act
+            case result of
+                Nothing -> loop
+                Just x -> pure x
+
         checkThread = do
             maybetid <- deRefWeak backgroundThread
             btid <- maybe (throwM ShuttleStopped) pure maybetid
@@ -170,29 +175,21 @@ startShuttle' tryLike runner = do
                 ThreadDied -> throwM ShuttleStopped
                 _ -> pure ()
 
+        timeoutAtomically delay act = do
+            expired <- atomically $ newTVar False
+            _ <- forkIO $ do
+                threadDelay delay
+                atomically $ writeTVar expired True
+            atomically $ do
+                done <- readTVar expired
+                if done then pure Nothing else Just <$> act
+
     -- Install the stop action as a finalizer on the TVar holding the
     -- remote call action.
     ref <- atomically $ newTVar (SF remote)
     _ <- mkWeakTVar ref stop
 
     return $ Shuttle ref stop
-
-
-timeoutAtomically :: Int -> STM a -> IO (Maybe a)
-timeoutAtomically delay act = do
-    expired <- atomically $ newTVar False
-    _ <- forkIO $ threadDelay delay >> atomically (writeTVar expired True)
-    atomically $ do
-        done <- readTVar expired
-        if done then pure Nothing else Just <$> act
-
-
-loopUntilJust :: IO (Maybe a) -> IO a
-loopUntilJust act = fix $ \loop -> do
-    result <- act
-    case result of
-        Nothing -> loop
-        Just x -> pure x
 
 
 -- | Signal to a Shuttle that it may be gracefully stopped. This stop
