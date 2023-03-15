@@ -3,7 +3,8 @@ module Control.Shuttle
   ( Shuttle
   , shuttle
   , startShuttle
-  , startShuttle'
+  , startShuttleTry
+  , startShuttleBase
   , stopShuttle
   , ShuttleStopped(..)
   ) where
@@ -101,21 +102,35 @@ shuttle (Shuttle ref _) act = do
     runSF sFunc act
 
 
--- | Calls startShuttle' with MonadCatch's try function. This is a
--- convenient default for instances of MonadCatch
+-- | Calls startShuttleBase with MonadIO's liftIO function and
+-- MonadCatch's try function. This is a convenient default
+-- implementation
 startShuttle
     :: (MonadCatch m, MonadIO m)
     => (m () -> IO ())
     -> IO (Shuttle m)
-startShuttle = startShuttle' try
+startShuttle = startShuttleBase liftIO try
+
+
+-- | Calls startShuttleBase with MonadIO's liftIO, but a user-supplied
+-- version of catch.
+startShuttleTry
+    :: MonadIO m
+    => (forall a. m a -> m (Either SomeException a))
+    -> (m () -> IO ())
+    -> IO (Shuttle m)
+startShuttleTry = startShuttleBase liftIO
 
 
 -- | Launches a background thread to execute actions in another
--- context. Actions are shuttled from the user the caller of shuttle
--- to the background thread, and results are shuttled back.
-startShuttle'
-    :: MonadIO m
-    => (forall a. m a -> m (Either SomeException a))
+-- context. Actions may be shuttled from the user the caller of
+-- shuttle to the background thread, and results are shuttled back.
+startShuttleBase
+    :: Monad m
+    => (forall a. IO a -> m a)
+    -- ^ A function to convert IO actions to m actions. This should
+    -- act like act like liftIO, including following the same laws.
+    -> (forall a. m a -> m (Either SomeException a))
     -- ^ A function to handle exceptions thrown when executing the
     -- action passed to it. This should act like 'try'. If the
     -- produced action throws an exception instead of returning it,
@@ -125,19 +140,19 @@ startShuttle'
     -- ^ run the m-environment block. This is called only once, at the
     -- start of the background thread.
     -> IO (Shuttle m)
-startShuttle' tryLike runner = do
+startShuttleBase liftLike tryLike runner = do
     (shutdown, request) <- atomically $ (,) <$> newTVar False <*> newEmptyTMVar
 
     -- fork off the background loop
     tid <- forkIO . runner . fix $ \loop -> do
-        next <- liftIO . atomically $ do
+        next <- liftLike . atomically $ do
             done <- readTVar shutdown
             if done then pure Nothing else Just <$> takeTMVar request
         case next of
             Nothing -> pure () -- graceful shutdown
             Just (Pack act send) -> do
                 result <- tryLike act
-                liftIO . atomically $ putTMVar send result
+                liftLike . atomically $ putTMVar send result
                 loop
 
     -- keep a weak reference to the ThreadId around to not cause GC issues
